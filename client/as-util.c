@@ -2874,6 +2874,30 @@ as_util_check_root_app (AsApp *app, GPtrArray *problems)
 }
 
 /**
+ * as_util_app_log:
+ **/
+G_GNUC_PRINTF (2, 3)
+static void
+as_util_app_log (AsApp *app, const gchar *fmt, ...)
+{
+	const gchar *id;
+	guint i;
+	va_list args;
+	_cleanup_free_ gchar *tmp = NULL;
+
+	va_start (args, fmt);
+	tmp = g_strdup_vprintf (fmt, args);
+	va_end (args);
+
+	/* print status */
+	id = as_app_get_id (app);
+	g_print ("%s: ", id);
+	for (i = strlen (id) + 2; i < 35; i++)
+		g_print (" ");
+	g_print ("%s\n", tmp);
+}
+
+/**
  * as_util_mirror_screenshots_thumb:
  **/
 static gboolean
@@ -2930,6 +2954,7 @@ as_util_mirror_screenshots_thumb (AsScreenshot *ss, AsImage *im_src,
  **/
 static gboolean
 as_util_mirror_screenshots_app_file (AsApp *app,
+				     const gchar *source_url,
 				     const gchar *filename,
 				     const gchar *mirror_uri,
 				     const gchar *output_dir,
@@ -2941,6 +2966,7 @@ as_util_mirror_screenshots_app_file (AsApp *app,
 	_cleanup_free_ gchar *basename = NULL;
 	_cleanup_free_ gchar *filename_no_path = NULL;
 	_cleanup_free_ gchar *url_src = NULL;
+	_cleanup_object_unref_ AsImage *im = NULL;
 	_cleanup_object_unref_ AsImage *im_src = NULL;
 	_cleanup_object_unref_ AsScreenshot *ss = NULL;
 	guint sizes[] = { AS_IMAGE_NORMAL_WIDTH,    AS_IMAGE_NORMAL_HEIGHT,
@@ -2994,6 +3020,12 @@ as_util_mirror_screenshots_app_file (AsApp *app,
 	as_screenshot_set_kind (ss, is_default ? AS_SCREENSHOT_KIND_DEFAULT :
 						 AS_SCREENSHOT_KIND_NORMAL);
 
+	/* add back the source image */
+	im = as_image_new ();
+	as_image_set_url (im, source_url, -1);
+	as_image_set_kind (im, AS_IMAGE_KIND_SOURCE);
+	as_screenshot_add_image (ss, im);
+
 	/* include the app-id in the basename */
 	basename = g_strdup_printf ("%s-%s.png",
 				    as_app_get_id_filename (AS_APP (app)),
@@ -3001,10 +3033,6 @@ as_util_mirror_screenshots_app_file (AsApp *app,
 	as_image_set_basename (im_src, basename);
 
 	/* fonts only have full sized screenshots */
-	url_src = g_build_filename (mirror_uri, "source", basename, NULL);
-	as_image_set_url (im_src, url_src, -1);
-	as_image_set_kind (im_src, AS_IMAGE_KIND_SOURCE);
-	as_screenshot_add_image (ss, im_src);
 	if (as_app_get_id_kind (AS_APP (app)) != AS_ID_KIND_FONT) {
 		for (i = 0; sizes[i] != 0; i += 2) {
 
@@ -3039,7 +3067,8 @@ as_util_mirror_screenshots_app_file (AsApp *app,
  * as_util_mirror_screenshots_app_url:
  **/
 static gboolean
-as_util_mirror_screenshots_app_url (AsApp *app,
+as_util_mirror_screenshots_app_url (AsUtilPrivate *priv,
+				    AsApp *app,
 				    const gchar *url,
 				    const gchar *mirror_uri,
 				    const gchar *cache_dir,
@@ -3054,6 +3083,22 @@ as_util_mirror_screenshots_app_url (AsApp *app,
 	_cleanup_object_unref_ SoupMessage *msg = NULL;
 	_cleanup_object_unref_ SoupSession *session = NULL;
 
+	/* local files, typically fonts */
+	if (g_str_has_prefix (url, "file:/")) {
+		_cleanup_free_ gchar *url_new = NULL;
+		_cleanup_object_unref_ AsImage *im = NULL;
+		_cleanup_object_unref_ AsScreenshot *ss = NULL;
+		url_new = g_build_filename (mirror_uri, "source", url + 6, NULL);
+		im = as_image_new ();
+		as_image_set_url (im, url_new, -1);
+		as_image_set_kind (im, AS_IMAGE_KIND_SOURCE);
+		ss = as_screenshot_new ();
+		as_screenshot_set_kind (ss, AS_SCREENSHOT_KIND_DEFAULT);
+		as_screenshot_add_image (ss, im);
+		as_app_add_screenshot (app, ss);
+		return TRUE;
+	}
+
 	/* set up networking */
 	session = soup_session_new_with_options (SOUP_SESSION_USER_AGENT, "appstream-util",
 						 SOUP_SESSION_TIMEOUT, 10,
@@ -3067,7 +3112,11 @@ as_util_mirror_screenshots_app_url (AsApp *app,
 					  cache_dir,
 					  as_app_get_id_filename (AS_APP (app)),
 					  basename);
-	if (!g_file_test (cache_filename, G_FILE_TEST_EXISTS)) {
+	if (g_file_test (cache_filename, G_FILE_TEST_EXISTS)) {
+		as_util_app_log (app, "In cache %s", cache_filename);
+	} else if (priv->nonet) {
+		as_util_app_log (app, "Missing %s:%s", url, cache_filename);
+	} else {
 		uri = soup_uri_new (url);
 		if (uri == NULL) {
 			ret = FALSE;
@@ -3077,8 +3126,8 @@ as_util_mirror_screenshots_app_url (AsApp *app,
 				     "Could not parse '%s' as a URL", url);
 			goto out;
 		}
-		g_print ("Downloading %s\n", url);
 		msg = soup_message_new_from_uri (SOUP_METHOD_GET, uri);
+		as_util_app_log (app, "Downloading %s", url);
 		status = soup_session_send_message (session, msg);
 		if (status != SOUP_STATUS_OK) {
 			ret = FALSE;
@@ -3097,10 +3146,12 @@ as_util_mirror_screenshots_app_url (AsApp *app,
 					   error);
 		if (!ret)
 			goto out;
+		as_util_app_log (app, "Saved to cache %s", cache_filename);
 	}
 
 	/* mirror the filename */
 	ret = as_util_mirror_screenshots_app_file (app,
+						   url,
 						   cache_filename,
 						   mirror_uri,
 						   output_dir,
@@ -3117,7 +3168,8 @@ out:
  * as_util_mirror_screenshots_app:
  **/
 static gboolean
-as_util_mirror_screenshots_app (AsApp *app,
+as_util_mirror_screenshots_app (AsUtilPrivate *priv,
+				AsApp *app,
 				GPtrArray *urls,
 				const gchar *mirror_uri,
 				const gchar *cache_dir,
@@ -3129,19 +3181,18 @@ as_util_mirror_screenshots_app (AsApp *app,
 
 	for (i = 0; i < urls->len; i++) {
 		_cleanup_error_free_ GError *error_local = NULL;
-		_cleanup_object_unref_ AsImage *im = NULL;
-		_cleanup_object_unref_ AsScreenshot *ss = NULL;
 
 		/* download URL or get from cache */
 		url = g_ptr_array_index (urls, i);
-		if (!as_util_mirror_screenshots_app_url (app,
+		if (!as_util_mirror_screenshots_app_url (priv,
+							 app,
 							 url,
 							 mirror_uri,
 							 cache_dir,
 							 output_dir,
 							 &error_local)) {
-			g_warning ("Failed to download %s: %s",
-				   url, error_local->message);
+			as_util_app_log (app, "Failed to download %s: %s",
+					 url, error_local->message);
 			continue;
 		}
 	}
@@ -3252,7 +3303,7 @@ as_util_mirror_screenshots (AsUtilPrivate *priv, gchar **values, GError **error)
 			continue;
 
 		/* download and save new versions */
-		if (!as_util_mirror_screenshots_app (app, urls,
+		if (!as_util_mirror_screenshots_app (priv, app, urls,
 						     values[1],
 						     cache_dir,
 						     output_dir,
@@ -3263,6 +3314,7 @@ as_util_mirror_screenshots (AsUtilPrivate *priv, gchar **values, GError **error)
 	/* save file */
 	if (!as_store_to_file (store, file,
 			       AS_NODE_TO_XML_FLAG_ADD_HEADER |
+			       AS_NODE_TO_XML_FLAG_FORMAT_INDENT |
 			       AS_NODE_TO_XML_FLAG_FORMAT_MULTILINE,
 			       NULL, error))
 		return FALSE;
