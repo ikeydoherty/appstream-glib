@@ -629,7 +629,7 @@ asb_context_setup (AsbContext *ctx, GError **error)
 	if (!asb_utils_ensure_exists (priv->output_dir, error))
 		return FALSE;
 	screenshot_dir1 = g_build_filename (priv->temp_dir, "screenshots", NULL);
-	if (!asb_utils_ensure_exists (screenshot_dir1, error))
+	if (!asb_utils_ensure_exists_and_empty (screenshot_dir1, error))
 		return FALSE;
 	screenshot_dir2 = g_build_filename (priv->cache_dir, "screenshots", NULL);
 	if (!asb_utils_ensure_exists (screenshot_dir2, error))
