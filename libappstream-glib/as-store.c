@@ -65,8 +65,10 @@ struct _AsStorePrivate
 	GPtrArray		*file_monitors;	/* of GFileMonitor */
 	GHashTable		*metadata_indexes;	/* GHashTable{key} */
 	AsStoreAddFlags		 add_flags;
+	AsStoreWatchFlags	 watch_flags;
 	AsStoreProblems		 problems;
 	guint32			 filter;
+	guint			 changed_block_refcnt;
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (AsStore, as_store, G_TYPE_OBJECT)
@@ -126,6 +128,7 @@ as_store_init (AsStore *store)
 	AsStorePrivate *priv = GET_PRIVATE (store);
 	priv->api_version = AS_API_VERSION_NEWEST;
 	priv->array = g_ptr_array_new_with_free_func ((GDestroyNotify) g_object_unref);
+	priv->watch_flags = AS_STORE_WATCH_FLAG_NONE;
 	priv->hash_id = g_hash_table_new_full (g_str_hash,
 					       g_str_equal,
 					       NULL,
@@ -166,6 +169,45 @@ as_store_class_init (AsStoreClass *klass)
 			      G_TYPE_NONE, 0);
 
 	object_class->finalize = as_store_finalize;
+}
+
+/**
+ * as_store_emit_changed:
+ */
+static void
+as_store_emit_changed (AsStore *store)
+{
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	if (priv->changed_block_refcnt > 0) {
+		g_debug ("ignoring emit changed");
+		return;
+	}
+	g_debug ("Emitting ::changed()");
+	g_signal_emit (store, signals[SIGNAL_CHANGED], 0);
+}
+
+/**
+ * as_store_changed_signal_block:
+ */
+static void
+as_store_changed_signal_block (AsStore *store)
+{
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	priv->changed_block_refcnt++;
+}
+
+/**
+ * as_store_changed_signal_unblock:
+ */
+static void
+as_store_changed_signal_unblock (AsStore *store)
+{
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	if (priv->changed_block_refcnt == 0) {
+		g_critical ("changed_block_refcnt already zero");
+		return;
+	}
+	priv->changed_block_refcnt--;
 }
 
 /**
@@ -843,6 +885,9 @@ as_store_from_root (AsStore *store,
 	/* add addon kinds to their parent AsApp */
 	as_store_match_addons (store);
 
+	/* this store has changed */
+	as_store_emit_changed (store);
+
 	return TRUE;
 }
 
@@ -912,6 +957,149 @@ as_store_load_yaml_file (AsStore *store,
 }
 
 /**
+ * as_store_remove_by_source_file:
+ */
+static void
+as_store_remove_by_source_file (AsStore *store, const gchar *filename)
+{
+	AsApp *app;
+	GPtrArray *apps;
+	guint i;
+	const gchar *tmp;
+	_cleanup_ptrarray_unref_ GPtrArray *ids = NULL;
+
+	/* find any applications in the store with this source file */
+	ids = g_ptr_array_new_with_free_func (g_free);
+	apps = as_store_get_apps (store);
+	for (i = 0; i < apps->len; i++) {
+		app = g_ptr_array_index (apps, i);
+		if (g_strcmp0 (as_app_get_source_file (app), filename) != 0)
+			continue;
+		g_ptr_array_add (ids, g_strdup (as_app_get_id (app)));
+	}
+
+	/* remove these from the store */
+	for (i = 0; i < ids->len; i++) {
+		tmp = g_ptr_array_index (ids, i);
+		g_debug ("removing %s as %s invalid", tmp, filename);
+		as_store_remove_app_by_id (store, tmp);
+	}
+
+	/* the store changed */
+	if (ids->len > 0)
+		as_store_emit_changed (store);
+}
+
+/**
+ * _g_file_monitor_to_string:
+ */
+static const gchar *
+_g_file_monitor_to_string (GFileMonitorEvent ev)
+{
+	if (ev == G_FILE_MONITOR_EVENT_CHANGED)
+		return "CHANGED";
+	if (ev == G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT)
+		return "CHANGES_DONE_HINT";
+	if (ev == G_FILE_MONITOR_EVENT_DELETED)
+		return "DELETED";
+	if (ev == G_FILE_MONITOR_EVENT_CREATED)
+		return "CREATED";
+	if (ev == G_FILE_MONITOR_EVENT_ATTRIBUTE_CHANGED)
+		return "ATTRIBUTE_CHANGED";
+	if (ev == G_FILE_MONITOR_EVENT_PRE_UNMOUNT)
+		return "PRE_UNMOUNT";
+	if (ev == G_FILE_MONITOR_EVENT_UNMOUNTED)
+		return "UNMOUNTED";
+	if (ev == G_FILE_MONITOR_EVENT_MOVED)
+		return "MOVED";
+	return NULL;
+}
+
+/**
+ * as_store_cache_changed_file_cb:
+ */
+static void
+as_store_cache_changed_file_cb (GFileMonitor *monitor,
+				GFile *file, GFile *other_file,
+				GFileMonitorEvent event_type,
+				AsStore *store)
+{
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	_cleanup_error_free_ GError *error = NULL;
+	_cleanup_free_ gchar *filename = NULL;
+
+	filename = g_file_get_path (file);
+	g_debug ("modified{file}: %s %s",
+		 filename, _g_file_monitor_to_string (event_type));
+	switch (event_type) {
+	case G_FILE_MONITOR_EVENT_DELETED:
+		/* remove, or emit a signal */
+		if (priv->watch_flags & AS_STORE_WATCH_FLAG_REMOVED) {
+			as_store_remove_by_source_file (store, filename);
+		} else {
+			as_store_emit_changed (store);
+		}
+		break;
+	case G_FILE_MONITOR_EVENT_CREATED:
+	case G_FILE_MONITOR_EVENT_CHANGED:
+		/* reload, or emit a signal */
+		if (priv->watch_flags & AS_STORE_WATCH_FLAG_ADDED) {
+			as_store_changed_signal_block (store);
+			as_store_remove_by_source_file (store, filename);
+			as_store_changed_signal_unblock (store);
+			g_debug ("rescanning %s", filename);
+			if (!as_store_from_file (store, file, NULL, NULL, &error))
+				g_warning ("failed to rescan: %s", error->message);
+		} else {
+			as_store_emit_changed (store);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static gboolean
+as_store_load_app_info_file (AsStore *store,
+			     const gchar *path_xml,
+			     const gchar *icon_root,
+			     GCancellable *cancellable,
+			     GError **error);
+
+/**
+ * as_store_monitor_file:
+ **/
+static gboolean
+as_store_monitor_file (AsStore *store,
+		       GFile *file,
+		       GCancellable *cancellable,
+		       GError **error)
+{
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	_cleanup_error_free_ GError *error_local = NULL;
+	_cleanup_object_unref_ GFileMonitor *monitor = NULL;
+
+	monitor = g_file_monitor (file,
+				  G_FILE_MONITOR_SEND_MOVED,
+				  cancellable,
+				  &error_local);
+	if (monitor == NULL) {
+		_cleanup_free_ gchar *path = g_file_get_path (file);
+		g_set_error (error,
+			     AS_STORE_ERROR,
+			     AS_STORE_ERROR_FAILED,
+			     "Failed to monitor %s: %s",
+			     path, error_local->message);
+		return FALSE;
+	}
+	g_signal_connect (monitor, "changed",
+			  G_CALLBACK (as_store_cache_changed_file_cb),
+			  store);
+	g_ptr_array_add (priv->file_monitors, g_object_ref (monitor));
+	return TRUE;
+}
+
+/**
  * as_store_from_file:
  * @store: a #AsStore instance.
  * @file: a #GFile.
@@ -937,6 +1125,7 @@ as_store_from_file (AsStore *store,
 		    GCancellable *cancellable,
 		    GError **error)
 {
+	AsStorePrivate *priv = GET_PRIVATE (store);
 	_cleanup_free_ gchar *filename = NULL;
 	_cleanup_error_free_ GError *error_local = NULL;
 	_cleanup_node_unref_ GNode *root = NULL;
@@ -962,6 +1151,13 @@ as_store_from_file (AsStore *store,
 			     filename, error_local->message);
 		return FALSE;
 	}
+
+	/* watch for file changes */
+	if (priv->watch_flags > 0) {
+		if (!as_store_monitor_file (store, file, cancellable, error))
+			return FALSE;
+	}
+
 	return as_store_from_root (store, root, icon_root, filename, error);
 }
 
@@ -1375,6 +1571,39 @@ as_store_set_add_flags (AsStore *store, AsStoreAddFlags add_flags)
 }
 
 /**
+ * as_store_get_watch_flags:
+ * @store: a #AsStore instance.
+ *
+ * Gets the flags used for adding files to the store.
+ *
+ * Returns: the #AsStoreWatchFlags, or 0 if unset
+ *
+ * Since: 0.4.2
+ **/
+AsStoreWatchFlags
+as_store_get_watch_flags (AsStore *store)
+{
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	return priv->watch_flags;
+}
+
+/**
+ * as_store_set_watch_flags:
+ * @store: a #AsStore instance.
+ * @watch_flags: the #AsStoreWatchFlags, e.g. %AS_STORE_WATCH_FLAG_NONE
+ *
+ * Sets the flags used when adding files to the store.
+ *
+ * Since: 0.4.2
+ **/
+void
+as_store_set_watch_flags (AsStore *store, AsStoreWatchFlags watch_flags)
+{
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	priv->watch_flags = watch_flags;
+}
+
+/**
  * as_store_guess_origin_fallback:
  */
 static gboolean
@@ -1444,8 +1673,30 @@ as_store_cache_changed_cb (GFileMonitor *monitor,
 			   GFileMonitorEvent event_type,
 			   AsStore *store)
 {
-	g_debug ("Emitting ::changed()");
-	g_signal_emit (store, signals[SIGNAL_CHANGED], 0);
+	AsStorePrivate *priv = GET_PRIVATE (store);
+	_cleanup_error_free_ GError *error = NULL;
+	_cleanup_free_ gchar *filename = NULL;
+
+	filename = g_file_get_path (file);
+	g_debug ("modified{dir}: %s %s",
+		 filename, _g_file_monitor_to_string (event_type));
+	if (!g_file_test (filename, G_FILE_TEST_EXISTS))
+		return;
+	switch (event_type) {
+	case G_FILE_MONITOR_EVENT_CREATED:
+		/* reload, or emit a signal */
+		if (priv->watch_flags & AS_STORE_WATCH_FLAG_ADDED) {
+			g_debug ("scanning %s", filename);
+			if (!as_store_load_app_info_file (store, filename,
+							  NULL, NULL, &error))
+				g_warning ("failed to rescan: %s", error->message);
+		} else {
+			as_store_emit_changed (store);
+		}
+		break;
+	default:
+		break;
+	}
 }
 
 /**
