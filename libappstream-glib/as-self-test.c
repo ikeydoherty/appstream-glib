@@ -132,11 +132,10 @@ static void
 monitor_test_cb (AsMonitor *mon, const gchar *filename, guint *cnt)
 {
 	(*cnt)++;
-//	as_test_loop_quit ();
 }
 
 static void
-as_test_monitor_func (void)
+as_test_monitor_dir_func (void)
 {
 	gboolean ret;
 	guint cnt_added = 0;
@@ -174,6 +173,7 @@ as_test_monitor_func (void)
 	g_assert_no_error (error);
 	g_assert (ret);
 	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
 	g_assert_cmpint (cnt_added, ==, 1);
 	g_assert_cmpint (cnt_removed, ==, 0);
 	g_assert_cmpint (cnt_changed, ==, 0);
@@ -184,6 +184,7 @@ as_test_monitor_func (void)
 	g_assert_no_error (error);
 	g_assert (ret);
 	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
 	g_assert_cmpint (cnt_added, ==, 0);
 	g_assert_cmpint (cnt_removed, ==, 0);
 	g_assert_cmpint (cnt_changed, ==, 0);
@@ -192,6 +193,7 @@ as_test_monitor_func (void)
 	cnt_added = cnt_removed = cnt_changed = 0;
 	g_unlink (tmpfile);
 	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
 	g_assert_cmpint (cnt_added, ==, 0);
 	g_assert_cmpint (cnt_removed, ==, 1);
 	g_assert_cmpint (cnt_changed, ==, 0);
@@ -202,6 +204,7 @@ as_test_monitor_func (void)
 	g_assert_no_error (error);
 	g_assert (ret);
 	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
 	g_assert_cmpint (cnt_added, ==, 1);
 	g_assert_cmpint (cnt_removed, ==, 0);
 	g_assert_cmpint (cnt_changed, ==, 0);
@@ -212,6 +215,7 @@ as_test_monitor_func (void)
 	g_assert_no_error (error);
 	g_assert (ret);
 	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
 	g_assert_cmpint (cnt_added, ==, 0);
 	g_assert_cmpint (cnt_removed, ==, 0);
 	g_assert_cmpint (cnt_changed, ==, 1);
@@ -220,6 +224,103 @@ as_test_monitor_func (void)
 	cnt_added = cnt_removed = cnt_changed = 0;
 	g_rename (tmpfile, tmpfile_new);
 	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
+	g_assert_cmpint (cnt_added, ==, 1);
+	g_assert_cmpint (cnt_removed, ==, 1);
+	g_assert_cmpint (cnt_changed, ==, 0);
+
+	g_unlink (tmpfile);
+	g_unlink (tmpfile_new);
+}
+
+static void
+as_test_monitor_file_func (void)
+{
+	gboolean ret;
+	guint cnt_added = 0;
+	guint cnt_removed = 0;
+	guint cnt_changed = 0;
+	_cleanup_object_unref_ AsMonitor *mon = NULL;
+	_cleanup_error_free_ GError *error = NULL;
+	const gchar *tmpfile = "/tmp/one.txt";
+	const gchar *tmpfile_new = "/tmp/two.txt";
+	_cleanup_free_ gchar *cmd_touch = NULL;
+
+	g_unlink (tmpfile);
+	g_unlink (tmpfile_new);
+
+	mon = as_monitor_new ();
+	g_signal_connect (mon, "added",
+			  G_CALLBACK (monitor_test_cb), &cnt_added);
+	g_signal_connect (mon, "removed",
+			  G_CALLBACK (monitor_test_cb), &cnt_removed);
+	g_signal_connect (mon, "changed",
+			  G_CALLBACK (monitor_test_cb), &cnt_changed);
+
+	/* add a single file */
+	ret = as_monitor_add_file (mon, tmpfile, NULL, &error);
+	g_assert_no_error (error);
+	g_assert (ret);
+
+	/* touch file */
+	cnt_added = cnt_removed = cnt_changed = 0;
+	cmd_touch = g_strdup_printf ("touch %s", tmpfile);
+	ret = g_spawn_command_line_sync (cmd_touch, NULL, NULL, NULL, &error);
+	g_assert_no_error (error);
+	g_assert (ret);
+	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
+	g_assert_cmpint (cnt_added, ==, 1);
+	g_assert_cmpint (cnt_removed, ==, 0);
+	g_assert_cmpint (cnt_changed, ==, 0);
+
+	/* just change the mtime */
+	cnt_added = cnt_removed = cnt_changed = 0;
+	ret = g_spawn_command_line_sync (cmd_touch, NULL, NULL, NULL, &error);
+	g_assert_no_error (error);
+	g_assert (ret);
+	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
+	g_assert_cmpint (cnt_added, ==, 0);
+	g_assert_cmpint (cnt_removed, ==, 0);
+	g_assert_cmpint (cnt_changed, ==, 0);
+
+	/* delete it */
+	cnt_added = cnt_removed = cnt_changed = 0;
+	g_unlink (tmpfile);
+	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
+	g_assert_cmpint (cnt_added, ==, 0);
+	g_assert_cmpint (cnt_removed, ==, 1);
+	g_assert_cmpint (cnt_changed, ==, 0);
+
+	/* save a new file with temp copy */
+	cnt_added = cnt_removed = cnt_changed = 0;
+	ret = g_file_set_contents (tmpfile, "foo", -1, &error);
+	g_assert_no_error (error);
+	g_assert (ret);
+	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
+	g_assert_cmpint (cnt_added, ==, 1);
+	g_assert_cmpint (cnt_removed, ==, 0);
+	g_assert_cmpint (cnt_changed, ==, 0);
+
+	/* modify file with temp copy */
+	cnt_added = cnt_removed = cnt_changed = 0;
+	ret = g_file_set_contents (tmpfile, "bar", -1, &error);
+	g_assert_no_error (error);
+	g_assert (ret);
+	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
+	g_assert_cmpint (cnt_added, ==, 0);
+	g_assert_cmpint (cnt_removed, ==, 0);
+	g_assert_cmpint (cnt_changed, ==, 1);
+
+	/* rename the file */
+	cnt_added = cnt_removed = cnt_changed = 0;
+	g_rename (tmpfile, tmpfile_new);
+	as_test_loop_run_with_timeout (2000);
+	as_test_loop_quit ();
 	g_assert_cmpint (cnt_added, ==, 1);
 	g_assert_cmpint (cnt_removed, ==, 1);
 	g_assert_cmpint (cnt_changed, ==, 0);
@@ -3900,7 +4001,8 @@ main (int argc, char **argv)
 	g_log_set_fatal_mask (NULL, G_LOG_LEVEL_ERROR | G_LOG_LEVEL_CRITICAL);
 
 	/* tests go here */
-	g_test_add_func ("/AppStream/monitor", as_test_monitor_func);
+	g_test_add_func ("/AppStream/monitor{dir}", as_test_monitor_dir_func);
+	g_test_add_func ("/AppStream/monitor{file}", as_test_monitor_file_func);
 	g_test_add_func ("/AppStream/tag", as_test_tag_func);
 	g_test_add_func ("/AppStream/provide", as_test_provide_func);
 	g_test_add_func ("/AppStream/release", as_test_release_func);

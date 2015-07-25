@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
  *
- * Copyright (C) 2013-2014 Richard Hughes <richard@hughsie.com>
+ * Copyright (C) 2015 Richard Hughes <richard@hughsie.com>
  *
  * Licensed under the GNU Lesser General Public License Version 2.1
  *
@@ -45,7 +45,7 @@ struct _AsMonitorPrivate
 	GPtrArray		*queue_add;	/* of gchar* */
 	GPtrArray		*queue_changed;	/* of gchar* */
 	GPtrArray		*queue_temp;	/* of gchar* */
-	
+	guint			 pending_id;
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (AsMonitor, as_monitor, G_TYPE_OBJECT)
@@ -86,6 +86,8 @@ as_monitor_finalize (GObject *object)
 	AsMonitor *monitor = AS_MONITOR (object);
 	AsMonitorPrivate *priv = GET_PRIVATE (monitor);
 
+	if (priv->pending_id)
+		g_source_remove (priv->pending_id);
 	g_ptr_array_unref (priv->array);
 	g_ptr_array_unref (priv->files);
 	g_ptr_array_unref (priv->queue_add);
@@ -233,6 +235,8 @@ _g_ptr_array_str_remove (GPtrArray *array, const gchar *fn)
 static void
 _g_ptr_array_str_add (GPtrArray *array, const gchar *fn)
 {
+	if (_g_ptr_array_str_find (array, fn) != NULL)
+		return;
 	g_ptr_array_add (array, g_strdup (fn));
 }
 
@@ -271,65 +275,119 @@ as_monitor_emit_changed (AsMonitor *monitor, const gchar *filename)
 }
 
 /**
- * as_monitor_directory_changed_cb:
+ * as_monitor_process_pending:
+ **/
+static void
+as_monitor_process_pending (AsMonitor *monitor)
+{
+	AsMonitorPrivate *priv = GET_PRIVATE (monitor);
+	guint i;
+	const gchar *tmp;
+
+	/* stop the timer */
+	if (priv->pending_id) {
+		g_source_remove (priv->pending_id);
+		priv->pending_id = 0;
+	}
+
+	/* emit all the pending changed signals */
+	for (i = 0; i < priv->queue_changed->len; i++) {
+		tmp = g_ptr_array_index (priv->queue_changed, i);
+		as_monitor_emit_changed (monitor, tmp);
+	}
+	g_ptr_array_set_size (priv->queue_changed, 0);
+
+	/* emit all the pending add signals */
+	for (i = 0; i < priv->queue_add->len; i++) {
+		tmp = g_ptr_array_index (priv->queue_add, i);
+		/* did we atomically replace an existing file */
+		if (_g_ptr_array_str_find (priv->files, tmp) != NULL) {
+			g_debug ("detecting atomic replace of existing file");
+			as_monitor_emit_changed (monitor, tmp);
+		} else {
+			as_monitor_emit_added (monitor, tmp);
+		}
+	}
+	g_ptr_array_set_size (priv->queue_add, 0);
+}
+
+/**
+ * as_monitor_process_pending_trigger_cb:
+ **/
+static gboolean
+as_monitor_process_pending_trigger_cb (gpointer user_data)
+{
+	AsMonitor *monitor = AS_MONITOR (user_data);
+	AsMonitorPrivate *priv = GET_PRIVATE (monitor);
+
+	g_debug ("No CHANGES_DONE_HINT, catching in timeout");
+	as_monitor_process_pending (monitor);
+	priv->pending_id = 0;
+	return FALSE;
+}
+
+/**
+ * as_monitor_process_pending_trigger:
+ **/
+static void
+as_monitor_process_pending_trigger (AsMonitor *monitor)
+{
+	AsMonitorPrivate *priv = GET_PRIVATE (monitor);
+	if (priv->pending_id)
+		g_source_remove (priv->pending_id);
+	priv->pending_id = g_timeout_add (800,
+					  as_monitor_process_pending_trigger_cb,
+					  monitor);
+}
+
+/**
+ * as_monitor_file_changed_cb:
  *
  * touch newfile      -> CREATED+CHANGED+ATTRIBUTE_CHANGED+CHANGES_DONE_HINT
+ *                       or, just CREATED
  * touch newfile      -> ATTRIBUTE_CHANGED+CHANGES_DONE_HINT
  * echo "1" > newfile -> CHANGED+CHANGES_DONE_HINT
  * rm newfile         -> DELETED
  **/
 static void
-as_monitor_directory_changed_cb (GFileMonitor *mon,
+as_monitor_file_changed_cb (GFileMonitor *mon,
 				 GFile *file, GFile *other_file,
 				 GFileMonitorEvent event_type,
 				 AsMonitor *monitor)
 {
 	AsMonitorPrivate *priv = GET_PRIVATE (monitor);
-	guint i;
 	const gchar *tmp;
+	gboolean is_temp;
 	_cleanup_free_ gchar *filename = NULL;
 	_cleanup_free_ gchar *filename_other = NULL;
 
+	/* get both filenames */
 	filename = g_file_get_path (file);
+	is_temp = !g_file_test (filename, G_FILE_TEST_EXISTS);
 	if (other_file != NULL)
 		filename_other = g_file_get_path (other_file);
-	g_debug ("modified{dir}: %s %s [%i]",
-		filename, _g_file_monitor_to_string (event_type),
-		g_file_test (filename, G_FILE_TEST_EXISTS));
+	g_debug ("modified: %s %s [%i]", filename,
+		_g_file_monitor_to_string (event_type), is_temp);
 
 	switch (event_type) {
 	case G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT:
-		for (i = 0; i < priv->queue_add->len; i++) {
-			tmp = g_ptr_array_index (priv->queue_add, i);
-
-			/* did we atomically replace an existing file */
-			if (_g_ptr_array_str_find (priv->files, tmp) != NULL) {
-				g_debug ("detecting atomic replace of existing file");
-				as_monitor_emit_changed (monitor, tmp);
-			} else {
-				as_monitor_emit_added (monitor, tmp);
-			}
-		}
-		for (i = 0; i < priv->queue_changed->len; i++) {
-			tmp = g_ptr_array_index (priv->queue_changed, i);
-			as_monitor_emit_changed (monitor, tmp);
-		}
-		g_ptr_array_set_size (priv->queue_add, 0);
-		g_ptr_array_set_size (priv->queue_changed, 0);
+		as_monitor_process_pending (monitor);
 		break;
 	case G_FILE_MONITOR_EVENT_CREATED:
-		if (g_file_test (filename, G_FILE_TEST_EXISTS)) {
+		if (!is_temp) {
 			_g_ptr_array_str_add (priv->queue_add, filename);
 		} else {
 			_g_ptr_array_str_add (priv->queue_temp, filename);
 		}
+		/* file monitors do not send CHANGES_DONE_HINT */
+		as_monitor_process_pending_trigger (monitor);
 		break;
 	case G_FILE_MONITOR_EVENT_DELETED:
 		as_monitor_emit_removed (monitor, filename);
 		break;
 	case G_FILE_MONITOR_EVENT_CHANGED:
+		/* if the file is not pending and not a temp file, add */
 		if (_g_ptr_array_str_find (priv->queue_add, filename) == NULL &&
-		    _g_ptr_array_str_find (priv->queue_changed, filename) == NULL &&
 		    _g_ptr_array_str_find (priv->queue_temp, filename) == NULL) {
 			_g_ptr_array_str_add (priv->queue_changed, filename);
 		}
@@ -378,19 +436,18 @@ as_monitor_add_directory (AsMonitor *monitor,
 	while ((tmp = g_dir_read_name (dir)) != NULL) {
 		_cleanup_free_ gchar *fn = NULL;
 		fn = g_build_filename (filename, tmp, NULL);
-		if (_g_ptr_array_str_find (priv->files, fn) != NULL)
-			continue;
 		g_debug ("adding existing file: %s", fn);
 		_g_ptr_array_str_add (priv->files, fn);
 	}
 
 	/* create new file monitor */
 	file = g_file_new_for_path (filename);
-	mon = g_file_monitor_directory (file, G_FILE_MONITOR_SEND_MOVED, cancellable, error);
+	mon = g_file_monitor_directory (file, G_FILE_MONITOR_SEND_MOVED,
+					cancellable, error);
 	if (mon == NULL)
 		return FALSE;
 	g_signal_connect (mon, "changed",
-			  G_CALLBACK (as_monitor_directory_changed_cb), monitor);
+			  G_CALLBACK (as_monitor_file_changed_cb), monitor);
 	g_ptr_array_add (priv->array, g_object_ref (mon));
 
 	return TRUE;
@@ -406,12 +463,26 @@ as_monitor_add_file (AsMonitor *monitor,
 		     GError **error)
 {
 	AsMonitorPrivate *priv = GET_PRIVATE (monitor);
+	_cleanup_object_unref_ GFile *file = NULL;
+	_cleanup_object_unref_ GFileMonitor *mon = NULL;
 
 	/* already watched */
 	if (_g_ptr_array_str_find (priv->files, filename) != NULL)
 		return TRUE;
 
-	/* FIXME: DTRT */
+	/* create new file monitor */
+	file = g_file_new_for_path (filename);
+	mon = g_file_monitor_file (file, G_FILE_MONITOR_NONE,
+				   cancellable, error);
+	if (mon == NULL)
+		return FALSE;
+	g_signal_connect (mon, "changed",
+			  G_CALLBACK (as_monitor_file_changed_cb), monitor);
+	g_ptr_array_add (priv->array, g_object_ref (mon));
+
+	/* only add if actually exists */
+	if (g_file_test (filename, G_FILE_TEST_EXISTS))
+		_g_ptr_array_str_add (priv->files, filename);
 
 	return TRUE;
 }

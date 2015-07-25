@@ -29,10 +29,10 @@
 #include <glib-object.h>
 #include <gio/gio.h>
 
-#define AS_TYPE_MONITOR		(as_monitor_get_type())
-#define AS_MONITOR(obj)		(G_TYPE_CHECK_INSTANCE_CAST((obj), AS_TYPE_MONITOR, AsMonitor))
-#define AS_MONITOR_CLASS(cls)	(G_TYPE_CHECK_CLASS_CAST((cls), AS_TYPE_MONITOR, AsMonitorClass))
-#define AS_IS_MONITOR(obj)	(G_TYPE_CHECK_INSTANCE_TYPE((obj), AS_TYPE_MONITOR))
+#define AS_TYPE_MONITOR			(as_monitor_get_type())
+#define AS_MONITOR(obj)			(G_TYPE_CHECK_INSTANCE_CAST((obj), AS_TYPE_MONITOR, AsMonitor))
+#define AS_MONITOR_CLASS(cls)		(G_TYPE_CHECK_CLASS_CAST((cls), AS_TYPE_MONITOR, AsMonitorClass))
+#define AS_IS_MONITOR(obj)		(G_TYPE_CHECK_INSTANCE_TYPE((obj), AS_TYPE_MONITOR))
 #define AS_IS_MONITOR_CLASS(cls)	(G_TYPE_CHECK_CLASS_TYPE((cls), AS_TYPE_MONITOR))
 #define AS_MONITOR_GET_CLASS(obj)	(G_TYPE_INSTANCE_GET_CLASS((obj), AS_TYPE_MONITOR, AsMonitorClass))
 
